@@ -1,178 +1,554 @@
+import base64
 import asyncio
 import os
+import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
+from urllib.parse import urlparse
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
-from mcp import Client, StdioServerParameters
+from ollama import AsyncClient as OllamaClient
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamable_http_client
 from mcp_types import TextContent
 
-load_dotenv()  # load environment variables from .env
 
-ANTHROPIC_MODEL = "claude-sonnet-5"
-# Sonnet 5 thinks adaptively unless told otherwise, and max_tokens caps thinking
-# plus the reply, so leave room for both.
-MAX_TOKENS = 10000
+load_dotenv()
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "https://ollamauser:mhmt@ollama.envai.tr")
+
 MAX_TOOL_TURNS = 10
+
+DEFAULT_REMOTE_MCP_URL = "https://docs.langchain.com/mcp"
+
+headers = {}
+
+credentials = f"ollamauser:mhmt"
+encoded = base64.b64encode(
+    credentials.encode("utf-8")
+).decode("ascii")
+
+headers["Authorization"] = f"Basic {encoded}"
 
 
 class MCPClient:
     def __init__(self):
-        # Initialize session and client objects
-        self.client: Client | None = None
+        self.session: ClientSession | None = None
         self.exit_stack = AsyncExitStack()
-        self._anthropic: Anthropic | None = None
 
-    @property
-    def anthropic(self) -> Anthropic:
-        """Lazy-initialize Anthropic client when needed"""
-        if self._anthropic is None:
-            self._anthropic = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        return self._anthropic
+        # Ollama
+        self.ollama = OllamaClient(
+            host=OLLAMA_HOST,
+            headers=headers,
+        )
 
-    async def connect_to_server(self, server_script_path: str):
-        """Connect to an MCP server
+    # ========================================================
+    # MCP CONNECTION
+    # ========================================================
 
-        Args:
-            server_script_path: Path to the server script (.py or .js)
+    async def connect_to_server(self, server: str):
         """
+        Connect to either:
+
+        1. Local Python MCP server:
+             python client.py server.py
+
+        2. Local JavaScript MCP server:
+             python client.py server.js
+
+        3. Remote Streamable HTTP MCP server:
+             python client.py https://example.com/mcp
+        """
+
+        if server.startswith(("http://", "https://")):
+            await self.connect_to_remote_server(server)
+        else:
+            await self.connect_to_local_server(server)
+
+    async def connect_to_local_server(self, server_script_path: str):
+        """Connect to a local MCP server over stdio."""
+
         is_python = server_script_path.endswith(".py")
         is_js = server_script_path.endswith(".js")
+
         if not (is_python or is_js):
-            raise ValueError("Server script must be a .py or .js file")
+            raise ValueError(
+                "Local MCP server must be a .py or .js file"
+            )
 
         if is_python:
             path = Path(server_script_path).resolve()
+
             server_params = StdioServerParameters(
                 command="uv",
-                args=["--directory", str(path.parent), "run", path.name],
+                args=[
+                    "--directory",
+                    str(path.parent),
+                    "run",
+                    path.name,
+                ],
                 env=None,
             )
+
         else:
-            server_params = StdioServerParameters(command="node", args=[server_script_path], env=None)
+            server_params = StdioServerParameters(
+                command="node",
+                args=[server_script_path],
+                env=None,
+            )
 
-        # Client launches the command itself when given StdioServerParameters.
-        # "auto" probes server/discover, falling back to the 2025-11-25 handshake.
-        self.client = await self.exit_stack.enter_async_context(Client(server_params, mode="auto"))
+        print(f"\nConnecting to local MCP server: {server_script_path}")
 
-        # List available tools
-        response = await self.client.list_tools()
-        tools = response.tools
-        print(f"\nConnected over protocol {self.client.protocol_version} with tools:", [tool.name for tool in tools])
-
-    async def process_query(self, query: str) -> str:
-        """Process a query using Claude and available tools"""
-        messages = [{"role": "user", "content": query}]
-
-        tools_response = await self.client.list_tools()
-        available_tools = [
-            {"name": tool.name, "description": tool.description, "input_schema": tool.input_schema}
-            for tool in tools_response.tools
-        ]
-
-        final_text = []
-
-        response = self.anthropic.messages.create(
-            model=ANTHROPIC_MODEL, max_tokens=MAX_TOKENS, messages=messages, tools=available_tools
+        # stdio_client gives us the MCP read/write streams.
+        read_stream, write_stream = await self.exit_stack.enter_async_context(
+            stdio_client(server_params)
         )
 
-        for _ in range(MAX_TOOL_TURNS):
-            tool_uses = []
-            for content in response.content:
-                if content.type == "text":
-                    final_text.append(content.text)
-                elif content.type == "tool_use":
-                    tool_uses.append(content)
+        self.session = await self.exit_stack.enter_async_context(
+            ClientSession(
+                read_stream,
+                write_stream,
+            )
+        )
 
-            if not tool_uses:
-                return "\n".join(final_text)
+        await self.session.initialize()
 
-            tool_results = []
-            for tool_use in tool_uses:
-                # call_tool validates the result against the declared schema.
-                result = await self.client.call_tool(tool_use.name, tool_use.input)
-                final_text.append(f"[Calling tool {tool_use.name} with args {tool_use.input}]")
+        await self.show_tools()
 
-                # structured_content is data the application can use directly.
-                if isinstance(result.structured_content, list):
-                    final_text.append(f"[{tool_use.name} returned {len(result.structured_content)} items]")
+    async def connect_to_remote_server(self, url: str):
+        """Connect to a remote MCP server over Streamable HTTP."""
 
-                # content is a list of block types; forward only the text ones.
-                tool_results.append(
+        print(f"\nConnecting to remote MCP server:")
+        print(f"  {url}")
+
+        # Streamable HTTP MCP transport.
+        #
+        # Current MCP Python SDK returns:
+        #
+        #     read_stream, write_stream
+        #
+        # from streamable_http_client().
+        read_stream, write_stream = await self.exit_stack.enter_async_context(
+            streamable_http_client(url)
+        )
+
+        self.session = await self.exit_stack.enter_async_context(
+            ClientSession(
+                read_stream,
+                write_stream,
+            )
+        )
+
+        await self.session.initialize()
+
+        await self.show_tools()
+
+    async def show_tools(self):
+        """Print MCP server information and available tools."""
+
+        if self.session is None:
+            raise RuntimeError("MCP session is not connected")
+
+        response = await self.session.list_tools()
+
+        print(
+            f"\nConnected to MCP server "
+            f"using protocol {self.session.protocol_version}"
+        )
+
+        print("\nAvailable tools:")
+
+        for tool in response.tools:
+            print(f"  - {tool.name}")
+
+            if tool.description:
+                print(f"    {tool.description}")
+
+    # ========================================================
+    # MCP -> OLLAMA TOOL FORMAT
+    # ========================================================
+
+    async def get_ollama_tools(self):
+        """
+        Convert MCP tool definitions into Ollama's
+        tool-calling format.
+        """
+
+        if self.session is None:
+            raise RuntimeError("MCP session is not connected")
+
+        response = await self.session.list_tools()
+
+        ollama_tools = []
+
+        for tool in response.tools:
+            ollama_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "parameters": tool.input_schema,
+                    },
+                }
+            )
+
+        return ollama_tools
+
+    # ========================================================
+    # MCP TOOL RESULT
+    # ========================================================
+
+    def extract_tool_result(self, result) -> str:
+        """
+        Convert an MCP CallToolResult into text that can be
+        passed back to Ollama.
+        """
+
+        parts = []
+
+        # Normal MCP content blocks
+        for block in result.content:
+            if isinstance(block, TextContent):
+                parts.append(block.text)
+
+        # Some MCP servers return structured content.
+        if result.structured_content:
+            parts.append(
+                f"\nStructured content:\n"
+                f"{result.structured_content}"
+            )
+
+        if result.is_error:
+            parts.insert(0, "MCP tool returned an error.")
+
+        if not parts:
+            return "Tool returned no textual output."
+
+        return "\n".join(parts)
+
+    # ========================================================
+    # OLLAMA + MCP AGENT LOOP
+    # ========================================================
+
+    async def process_query(self, query: str) -> str:
+        """
+        Send a query to Ollama.
+
+        If Ollama decides that an MCP tool is required:
+
+            Ollama
+              ↓
+            MCP tool
+              ↓
+            result
+              ↓
+            Ollama
+              ↓
+            final answer
+        """
+
+        if self.session is None:
+            raise RuntimeError(
+                "MCP server is not connected"
+            )
+
+        tools = await self.get_ollama_tools()
+
+        messages = [
+            {
+                "role": "user",
+                "content": query,
+            }
+        ]
+
+        # ----------------------------------------------------
+        # First Ollama request
+        # ----------------------------------------------------
+
+        response = await self.ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=messages,
+            tools=tools,
+        )
+
+        for turn in range(MAX_TOOL_TURNS):
+
+            message = response["message"]
+
+            # ------------------------------------------------
+            # Normal response
+            # ------------------------------------------------
+
+            content = message.get("content", "")
+
+            tool_calls = message.get(
+                "tool_calls",
+                []
+            )
+
+            if content:
+                print(
+                    f"\nOllama: {content}"
+                )
+
+            # ------------------------------------------------
+            # No tools requested -> we're done
+            # ------------------------------------------------
+
+            if not tool_calls:
+                return content
+
+            # Add Ollama's assistant message to conversation.
+            messages.append(message)
+
+            # ------------------------------------------------
+            # Execute every requested tool
+            # ------------------------------------------------
+
+            for tool_call in tool_calls:
+
+                function = tool_call["function"]
+
+                tool_name = function["name"]
+                tool_args = function.get(
+                    "arguments",
+                    {},
+                )
+
+                print(
+                    f"\n[Tool call {turn + 1}]"
+                )
+
+                print(
+                    f"  Tool: {tool_name}"
+                )
+
+                print(
+                    f"  Args: {tool_args}"
+                )
+
+                try:
+
+                    result = await self.session.call_tool(
+                        tool_name,
+                        arguments=tool_args,
+                    )
+
+                    tool_output = self.extract_tool_result(
+                        result
+                    )
+
+                except Exception as e:
+
+                    tool_output = (
+                        f"Error executing MCP tool "
+                        f"{tool_name}: {e}"
+                    )
+
+                print(
+                    f"  Result:\n{tool_output[:1000]}"
+                )
+
+                # ------------------------------------------------
+                # Give the MCP result back to Ollama.
+                # ------------------------------------------------
+
+                messages.append(
                     {
-                        "type": "tool_result",
-                        "tool_use_id": tool_use.id,
-                        "content": "\n".join(block.text for block in result.content if isinstance(block, TextContent)),
-                        "is_error": bool(result.is_error),
+                        "role": "tool",
+                        "content": tool_output,
                     }
                 )
 
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": tool_results})
+            # ------------------------------------------------
+            # Ask Ollama to continue reasoning.
+            # ------------------------------------------------
 
-            response = self.anthropic.messages.create(
-                model=ANTHROPIC_MODEL,
-                max_tokens=MAX_TOKENS,
+            response = await self.ollama.chat(
+                model=OLLAMA_MODEL,
                 messages=messages,
-                tools=available_tools,
+                tools=tools,
             )
 
-        # The turn cap was hit. Keep the last response's text. If it asked for
-        # more tools, say they were not run.
-        final_text.extend(content.text for content in response.content if content.type == "text")
-        if any(content.type == "tool_use" for content in response.content):
-            final_text.append(f"[Stopped after {MAX_TOOL_TURNS} tool-use turns]")
-        return "\n".join(final_text)
+        return (
+            f"Ollama reached the maximum tool-call limit "
+            f"({MAX_TOOL_TURNS})."
+        )
+
+    # ========================================================
+    # CHAT LOOP
+    # ========================================================
 
     async def chat_loop(self):
-        """Run an interactive chat loop"""
-        print("\nMCP Client Started!")
-        print("Type your queries or 'quit' to exit.")
+        """Interactive terminal chat."""
+
+        print("\n========================================")
+        print(" Ollama + MCP Client")
+        print("========================================")
+        print(f"Model: {OLLAMA_MODEL}")
+        print(f"Ollama: {OLLAMA_HOST}")
+
+        print(
+            "\nType 'quit' or 'exit' to stop."
+        )
 
         while True:
-            # input() blocks, so keep it off the event loop.
-            try:
-                query = (await asyncio.to_thread(input, "\nQuery: ")).strip()
-            except (EOFError, KeyboardInterrupt):
-                break
-
-            if query.lower() == "quit":
-                break
 
             try:
-                response = await self.process_query(query)
-                print("\n" + response)
+                query = await asyncio.to_thread(
+                    input,
+                    "\nYou: ",
+                )
+
+            except (
+                EOFError,
+                KeyboardInterrupt,
+            ):
+                break
+
+            query = query.strip()
+
+            if not query:
+                continue
+
+            if query.lower() in {
+                "quit",
+                "exit",
+            }:
+                break
+
+            try:
+
+                response = await self.process_query(
+                    query
+                )
+
+                print(
+                    f"\nAssistant: {response}"
+                )
+
             except Exception as e:
-                print(f"\nError: {str(e)}")
+
+                print(
+                    f"\nError: {e}"
+                )
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
 
     async def cleanup(self):
-        """Clean up resources"""
+
         await self.exit_stack.aclose()
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 async def main():
+
     if len(sys.argv) < 2:
-        print("Usage: python client.py <path_to_server_script>")
+
+        print(
+            "Usage:"
+        )
+
+        print(
+            "\n  Local MCP:"
+        )
+
+        print(
+            "    python client.py server.py"
+        )
+
+        print(
+            "\n  Remote MCP:"
+        )
+
+        print(
+            "    python client.py "
+            "https://docs.langchain.com/mcp"
+        )
+
+        print(
+            "\nOr simply edit DEFAULT_REMOTE_MCP_URL."
+        )
+
         sys.exit(1)
 
-    client = MCPClient()
-    try:
-        await client.connect_to_server(sys.argv[1])
+    server = sys.argv[1]
 
-        # Check if we have a valid API key to continue
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            print("\nNo ANTHROPIC_API_KEY found. To query these tools with Claude, set your API key:")
-            print("  export ANTHROPIC_API_KEY=your-api-key-here")
+    client = MCPClient()
+
+    try:
+
+        # ----------------------------------------------------
+        # Check Ollama
+        # ----------------------------------------------------
+
+        print(
+            f"Checking Ollama at {OLLAMA_HOST}..."
+        )
+
+        try:
+
+            await client.ollama.list()
+
+        except Exception as e:
+
+            print(
+                "\nCould not connect to Ollama."
+            )
+
+            print(
+                "Make sure Ollama is running:"
+            )
+
+            print(
+                "\n  ollama serve"
+            )
+
+            print(
+                f"\nError: {e}"
+            )
+
             return
 
+        # ----------------------------------------------------
+        # Connect MCP
+        # ----------------------------------------------------
+
+        await client.connect_to_server(
+            server
+        )
+
+        # ----------------------------------------------------
+        # Start chat
+        # ----------------------------------------------------
+
         await client.chat_loop()
+
+    except Exception as e:
+
+        print(
+            f"\nFatal error: {e}"
+        )
+
     finally:
+
         await client.cleanup()
 
 
 if __name__ == "__main__":
-    import sys
 
     asyncio.run(main())
